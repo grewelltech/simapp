@@ -61,7 +61,16 @@ type Configuration struct {
 	NetworkSlice      []*NetworkSlice    `yaml:"network-slices,omitempty"`
 	Subscriber        []*Subscriber      `yaml:"subscribers,omitempty"`
 	MaxWorkers        int                `yaml:"max-workers,omitempty"`
+	// ProvisionTimeout bounds one provisioning request to the endpoint, from
+	// sending it to reading its response. It is the whole time webconsole has
+	// to carry out the request, which for a device group or a slice POST
+	// includes writing every subscriber of the group.
+	ProvisionTimeout time.Duration `yaml:"provision-timeout,omitempty"`
 }
+
+// defaultProvisionTimeout is the timeout a configuration without
+// provision-timeout gets: the value the client always had.
+const defaultProvisionTimeout = 30 * time.Second
 
 type DevGroup struct {
 	Name         string     `yaml:"name,omitempty"`
@@ -259,6 +268,8 @@ func InitConfigFactory(f string, subProvisionEndpt *SubProvisionEndpt) error {
 	if SimappConfig.Info != nil {
 		httpVersion = SimappConfig.Info.HttpVersion
 	}
+	timeout := provisionTimeout(SimappConfig.Configuration)
+	logger.SimappLog.Infof("provisioning request timeout: %s", timeout)
 	if httpVersion == 2 {
 		transport := &http.Transport{
 			MaxIdleConns:        100,
@@ -272,7 +283,7 @@ func InitConfigFactory(f string, subProvisionEndpt *SubProvisionEndpt) error {
 		transport.Protocols.SetUnencryptedHTTP2(true)
 		client = &http.Client{
 			Transport: transport,
-			Timeout:   30 * time.Second,
+			Timeout:   timeout,
 		}
 	} else {
 		transport := &http.Transport{
@@ -284,7 +295,7 @@ func InitConfigFactory(f string, subProvisionEndpt *SubProvisionEndpt) error {
 		}
 		client = &http.Client{
 			Transport: transport,
-			Timeout:   30 * time.Second,
+			Timeout:   timeout,
 		}
 	}
 
@@ -299,6 +310,15 @@ func InitConfigFactory(f string, subProvisionEndpt *SubProvisionEndpt) error {
 		return err
 	}
 	return nil
+}
+
+// provisionTimeout is the timeout configuration asks for, or the default when
+// it asks for none or for one that cannot be waited.
+func provisionTimeout(configuration *Configuration) time.Duration {
+	if configuration == nil || configuration.ProvisionTimeout <= 0 {
+		return defaultProvisionTimeout
+	}
+	return configuration.ProvisionTimeout
 }
 
 func syncConfig(w http.ResponseWriter, req *http.Request) {
@@ -438,6 +458,7 @@ func sendHttpReqMsg(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		logger.SimappLog.Errorln(err)
 	}
+	started := time.Now()
 	for {
 		cloneReq := req.Clone(context.Background())
 		req.Body = io.NopCloser(bytes.NewReader(body))
@@ -456,7 +477,8 @@ func sendHttpReqMsg(req *http.Request) (*http.Response, error) {
 				}
 			}
 			nextInterval := getNextBackoffInterval(retries, 2)
-			logger.SimappLog.Errorf("http req send error [%v], retrying after %d sec", err, nextInterval)
+			logger.SimappLog.Errorf("http req send error [%v] on attempt %d, %s after the first, retrying after %d sec",
+				err, retries, time.Since(started).Round(time.Second), nextInterval)
 			time.Sleep(time.Second * time.Duration(nextInterval))
 			continue
 		}
@@ -489,7 +511,8 @@ func sendHttpReqMsg(req *http.Request) (*http.Response, error) {
 				return rsp, fmt.Errorf("client error %d: %s", rsp.StatusCode, http.StatusText(rsp.StatusCode))
 			}
 			nextInterval := getNextBackoffInterval(retries, 2)
-			logger.SimappLog.Infof("http rsp error [%s], retrying after %d sec", http.StatusText(rsp.StatusCode), nextInterval)
+			logger.SimappLog.Infof("http rsp error [%s] on attempt %d, %s after the first, retrying after %d sec",
+				http.StatusText(rsp.StatusCode), retries, time.Since(started).Round(time.Second), nextInterval)
 			err = rsp.Body.Close()
 			if err != nil {
 				logger.SimappLog.Infoln(err)

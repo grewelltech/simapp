@@ -7,8 +7,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -229,5 +232,56 @@ func TestStopServerNeverStartedReturnsAtOnce(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("stopServer blocked on a server that was never started")
+	}
+}
+
+func TestProvisionTimeoutDefaultsWhenUnsetOrUnusable(t *testing.T) {
+	testCases := []struct {
+		configuration *Configuration
+		name          string
+		want          time.Duration
+	}{
+		{nil, "no configuration", defaultProvisionTimeout},
+		{&Configuration{}, "not set", defaultProvisionTimeout},
+		{&Configuration{ProvisionTimeout: -time.Second}, "negative", defaultProvisionTimeout},
+		{&Configuration{ProvisionTimeout: 5 * time.Minute}, "set", 5 * time.Minute},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := provisionTimeout(tc.configuration); got != tc.want {
+				t.Errorf("expected %s, got %s", tc.want, got)
+			}
+		})
+	}
+}
+
+// The timeout in the file has to reach the client that sends the provisioning
+// requests, for both transports.
+func TestInitConfigFactorySetsTheProvisioningTimeout(t *testing.T) {
+	testCases := []struct {
+		name        string
+		timeoutLine string
+		httpVersion int
+		want        time.Duration
+	}{
+		{"http/1.1, configured", "  provision-timeout: 2m\n", 1, 2 * time.Minute},
+		{"h2c, configured", "  provision-timeout: 90s\n", 2, 90 * time.Second},
+		{"http/1.1, not configured", "", 1, defaultProvisionTimeout},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := filepath.Join(t.TempDir(), "simapp.yaml")
+			content := fmt.Sprintf("info:\n  version: 1.0.0\n  http-version: %d\nlogger:\n  APP:\n    debugLevel: info\nconfiguration:\n%s  sub-provision-endpt:\n    addr: webui\n    port: 5000\n", tc.httpVersion, tc.timeoutLine)
+			if err := os.WriteFile(cfg, []byte(content), 0o600); err != nil {
+				t.Fatalf("failed to write the config: %v", err)
+			}
+			var endpoint SubProvisionEndpt
+			if err := InitConfigFactory(cfg, &endpoint); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if client.Timeout != tc.want {
+				t.Errorf("expected a client timeout of %s, got %s", tc.want, client.Timeout)
+			}
+		})
 	}
 }
